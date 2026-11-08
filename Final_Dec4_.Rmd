@@ -1,0 +1,456 @@
+---
+title: "Final Project 717"
+author: "Sakshi Tewari"
+date: "2025-11-26"
+output: html_document
+---
+#READ DATA
+```{r setup, include=FALSE}
+setwd("/Users/sakshitewari/Desktop/EPID 717/Final Project")
+study<- read.csv("usvacurg.csv")
+dim(study)
+names(study)
+
+target<- read.csv("target.csv")
+dim(target)
+names(target)
+```
+
+##Make new variables
+```{r cars}
+library(dplyr)
+library(survival)
+study <- study %>% mutate(htn=case_when(sbp<=120 & dbp<=80 ~0, sbp>120 & sbp<=130 & dbp<=80 ~1, sbp>130 | dbp>80~2))
+target <- target %>% mutate(htn=case_when(sbp<=120 & dbp<=80 ~0, sbp>120 & sbp<=130 & dbp<=80 ~1, sbp>130 | dbp>80~2))
+study$htn<- factor(study$htn, levels=c(0,1,2), labels=c("Normal","Elevated","Hypertension"))
+target$htn<- factor(target$htn, levels=c(0,1,2), labels=c("Normal","Elevated","Hypertension"))
+study$des<- factor(study$des, levels=c(0,1), labels=c("Placebo","DES 5mg"))
+
+#create indivator for target vs Study
+target$s<- 0
+study$s<-1
+
+```
+#AJ = event = 1, censoring=0, everything else = 2
+#Quick diagnostics age
+```{r}
+study<- study %>% mutate(agecat= cut(age,c(-Inf,70,72,74,75,80,Inf)))
+#linear for outocme 1?
+rates_event1<- study %>% select(time,event,agecat) %>% group_by(agecat) %>% summarize(persontime=sum(time),events=sum(event==1))
+rates_event1$IR<-rates_event1$events/(rates_event1$persontime/30.5)
+plot(x=rates_event1$agecat,y=rates_event1$IR)
+#SPline for outocme 2? at 75
+rates_event2<- study %>% select(time,event,agecat) %>% group_by(agecat) %>% summarize(persontime=sum(time),events=sum(event==2))
+rates_event2$IR<-rates_event2$events/(rates_event2$persontime/30.5)
+plot(x=rates_event2$agecat,y=rates_event2$IR)
+
+#spline for outocme 3? at 75
+rates_event3<- study %>% select(time,event,agecat) %>% group_by(agecat) %>% summarize(persontime=sum(time),events=sum(event==2))
+rates_event3$IR<-rates_event3$events/(rates_event3$persontime/30.5)
+plot(x=rates_event3$agecat,y=rates_event3$IR)
+
+```
+#IOSW
+```{r}
+#stack the datasets
+#stacked dataset with common vars
+stacked<- bind_rows(study,target)
+
+#sanity check- shoul be same
+dim(stacked)
+dim(target)[1] + dim(study)[1]
+
+#model for predicting selection into study from target
+model_iosw<- glm(s~ age + wt_index + cvd + htn + tumor_size + stage,data=stacked, family =binomial(link='logit'))
+summary(model_iosw)
+
+#generate predicted probabilities in the study dataset
+study$pred_s <- predict(model_iosw,newdata = study,type = "response")
+study$odds_s<- study$pred_s/(1-study$pred_s)
+study$iosw<- 1/study$odds_s
+
+#check for one ID
+View(study[which(study$id==3),c("age","wt_index","cvd","htn","tumor_size","stage","pred_s","odds_s","iosw")])
+#0.715030 + 0.009670*69 + 0.00414*102 + (-0.789616*1) + 0.008892*1 + 0.005273*3 + (-0.821810*3)
+#exp(-1.425795)/(1+exp(-1.425795))
+#0.1937547 matches pred_s
+```
+
+#IPTW
+```{r}
+study<- study %>% mutate(age_knot75= case_when(age<75 ~0, age>=75~ age-75))
+#convert des to a numeric version
+study<- study %>% mutate(des_num=case_when(des=="DES 5mg"~1, des=="Placebo"~0))
+model<- glm(des_num ~ age + wt_index + cvd + htn + tumor_size + stage, data=study, family=binomial(link='logit'))
+study$pred_des<- predict(model,type="response")
+study$iptw<- ((study$des_num)/(study$pred_des)) + ((1-study$des_num)/(1-study$pred_des))
+
+#check for one ID
+View(study[which(study$id==3),c("age","wt_index","cvd","htn","tumor_size","stage","pred_des","iptw")])
+#0.843470 + -0.003523*69 + -0.012316*102 + (0.131036*1) + -0.049571*1 + -0.004077*3 + ( 0.178525 *3)
+#exp(-0.05104)/(1+exp(-0.05104))
+#0.4872428 matches pred_des
+
+
+##########MAKE OVERALL WEIGHT###############
+study$overall_wt <- study$iptw * study$iosw
+
+```
+## Table 1
+
+```{r pressure, echo=FALSE}
+#############STUDY##################
+#categorical variables in study data
+cvd_des<-table(study$cvd,study$des, useNA="no" )
+cvd_des
+prop.table(cvd_des,margin = 2)
+
+htn_des<-table(study$htn,study$des, useNA="no" )
+htn_des
+prop.table(htn_des,margin = 2)
+
+stage_des<-table(study$stage,study$des, useNA="no" )
+stage_des
+prop.table(stage_des,margin = 2)
+
+#Continuous vars in study data
+T1_study_cont<- study %>% select(age,tumor_size,wt_index,des) %>% group_by(des) %>% summarise(age_sum=quantile(age,probs=c(0.25,0.5,0.75)), tumsize_sum=quantile(tumor_size,probs=c(0.25,0.5,0.75)),wtindex_sum=quantile(wt_index,probs=c(0.25,0.5,0.75))) %>% t()
+colnames(T1_study_cont) <- c("25%","Median","75%","25%","Median","75%") 
+
+#####################TARGET####################################
+#categorical variables in study data
+cvd_tar<-table(target$cvd, useNA="no" )
+cvd_tar
+prop.table(cvd_tar)
+
+htn_tar<-table(target$htn, useNA="no" )
+htn_tar
+prop.table(htn_tar)
+
+stage_tar<-table(target$stage, useNA="no" )
+stage_tar
+prop.table(stage_tar)
+
+#Continuous vars in Target data
+T1_target_cont<- target %>% select(age,tumor_size,wt_index) %>% summarise(age_sum=quantile(age,probs=c(0.25,0.5,0.75)), tumsize_sum=quantile(tumor_size,probs=c(0.25,0.5,0.75)),wtindex_sum=quantile(wt_index,probs=c(0.25,0.5,0.75))) %>% t()
+colnames(T1_target_cont) <- c("25%","Median","75%") 
+
+
+```
+
+#Table 2
+```{r}
+T2_weights<- cbind(iptw=summary(study$iptw), iosw=summary(study$iosw), overall=summary(study$overall_wt))
+T2_weights<- t(T2_weights)
+
+#SD
+sd(study$iptw)
+sd(study$iosw)
+sd(study$overall_wt)
+```
+
+#Question 3:
+```{r}
+#STRATIFY DATA BY TREATMENT
+placebo = study[study$des_num==0,] 
+DEG = study[study$des_num==1,]
+
+#FIT OVERALL KM- 1 if ANY event, 0 otherwise
+####PLACEBO####
+KMO_P <- survfit(Surv(time, (event > 0)) ~ 1, data = placebo,weights =iptw)
+hO_P <- data.frame(times = KMO_P$time, s = KMO_P$surv)
+####DEG####
+KMO_D <- survfit(Surv(time, (event > 0)) ~ 1, data = DEG,weights =iptw)
+hO_D <- data.frame(times = KMO_D$time, s = KMO_D$surv)
+
+
+#CAUSE_SPECIFIC : PROSTRATE
+####PLACEBO####
+KM1_P <- survfit(Surv(time, (event == 1)) ~ 1, data = placebo, weights =iptw)
+h1_P <- data.frame(times = KM1_P$time, d1 = KM1_P$n.event, n1 = KM1_P$n.risk, haz1 = KM1_P$n.event/KM1_P$n.risk)
+####DEG####
+KM1_D <- survfit(Surv(time, (event == 1)) ~ 1, data = DEG, weights = iptw)
+h1_D <- data.frame(times = KM1_D$time, d1 = KM1_D$n.event, n1 = KM1_D$n.risk, haz1 = KM1_D$n.event/KM1_D$n.risk)
+
+
+#CAUSE_SPECIFIC : CVD
+####PLACEBO####
+KM2_P <- survfit(Surv(time, (event == 2)) ~ 1, data = placebo, weights =iptw)
+h2_P <- data.frame(times = KM2_P$time, d2 = KM2_P$n.event, n2 = KM2_P$n.risk, haz2 = KM2_P$n.event/KM2_P$n.risk)
+####DEG####
+KM2_D <- survfit(Surv(time, (event == 2)) ~ 1, data = DEG, weights =iptw)
+h2_D <- data.frame(times = KM2_D$time, d2 = KM2_D$n.event, n2 = KM2_D$n.risk, haz2 = KM2_D$n.event/KM2_D$n.risk)
+
+
+#CAUSE_SPECIFIC : OTHER
+####PLACEBO####
+KM3_P <- survfit(Surv(time, (event == 3)) ~ 1, data = placebo, weights =iptw)
+h3_P <- data.frame(times = KM3_P$time, d3 = KM3_P$n.event, n3 = KM3_P$n.risk, haz3 = KM3_P$n.event/KM3_P$n.risk)
+####DEG####
+KM3_D <- survfit(Surv(time, (event == 3)) ~ 1, data = DEG, weights =iptw)
+h3_D <- data.frame(times = KM3_D$time, d3 = KM3_D$n.event, n3 = KM3_D$n.risk, haz3 = KM3_D$n.event/KM3_D$n.risk)
+
+library(tidyr)
+#MERGE: we want 2 datasets; Placebo, DEG..each with all cause-specific haz and overall surv
+####PLACEBO####
+placebo_AJ <-  h1_P |> full_join(h2_P) |> full_join(h3_P) |> full_join(hO_P) |> 
+  replace_na(list(d1 = 0, haz1 = 0, d2 = 0, haz2 = 0,d3 = 0, haz3 = 0)) |> arrange(times)
+
+placebo_AJ <- placebo_AJ |> 
+  mutate(aj1 = cumsum(haz1 * lag(s, default = 1)), 
+         aj2 = cumsum(haz2 * lag(s, default = 1)), 
+         aj3 = cumsum(haz3 * lag(s, default = 1)),
+         composite = aj1 + aj2 + aj3, 
+         composite2 = 1 - s)
+
+###DEG####
+DEG_AJ <-  h1_D |> full_join(h2_D) |> full_join(h3_D) |> full_join(hO_D) |> 
+  replace_na(list(d1 = 0, haz1 = 0, d2 = 0, haz2 = 0,d3 = 0, haz3 = 0)) |> arrange(times)
+
+DEG_AJ <- DEG_AJ |> 
+  mutate(aj1 = cumsum(haz1 * lag(s, default = 1)), 
+         aj2 = cumsum(haz2 * lag(s, default = 1)), 
+         aj3 = cumsum(haz3 * lag(s, default = 1)),
+         composite = aj1 + aj2 + aj3, 
+         composite2 = 1 - s)
+
+#MERGE THE RISKS FOR PLACEBO AND DEG
+rdiff = merge(cbind(time = placebo_AJ$times,risk_P_O=placebo_AJ$composite, # Overall Time and risk for A=0
+                    risk_P_1=placebo_AJ$aj1,risk_P_2=placebo_AJ$aj2,risk_P_3=placebo_AJ$aj3),
+               # Overall Time and risk for A=1
+                cbind(time = DEG_AJ$times,risk_D_O=DEG_AJ$composite,risk_D_1=DEG_AJ$aj1,
+                      risk_D_2=DEG_AJ$aj2,risk_D_3=DEG_AJ$aj3),
+                by = "time",all=TRUE)                # Outer merge risk data on time
+
+rdiff = rdiff %>% 
+  fill(c("risk_P_O","risk_D_O","risk_P_1","risk_D_1","risk_P_2","risk_D_2","risk_P_3","risk_D_3"),.direction="down")     # Forward-filling all missing risks on aligned times
+
+rdiff$rd_O = with(rdiff, risk_D_O-risk_P_O)          # Computing the risk difference across columns
+rdiff$rd_1 = with(rdiff, risk_D_1-risk_P_1)          # Computing the risk difference across columns
+rdiff$rd_2 = with(rdiff, risk_D_2-risk_P_2)          # Computing the risk difference across columns
+rdiff$rd_3 = with(rdiff, risk_D_3-risk_P_3)          # Computing the risk difference across columns
+
+
+# display results
+library(ggplot2)
+
+plot_Q3<- ggplot() +
+  geom_step(data = rdiff, aes(time, rd_O, colour = "Overall"), linetype = "dashed") +
+  geom_step(data = rdiff, aes(time, rd_1, colour = "Prostate Cancer"), linetype = "dashed") +
+  geom_step(data = rdiff, aes(time, rd_2, colour = "CVD"), linetype = "dashed") +
+  geom_step(data = rdiff, aes(time, rd_3, colour = "Other"), linetype = "dashed") +
+  
+  scale_color_manual(
+    name = "Cause of Death",
+    values = c(
+      "Overall" = "black",
+      "Prostate Cancer" = "blue",
+      "CVD" = "red",
+      "Other" = "green"
+    )
+  ) +
+  
+  xlab("Months since Randomization") +
+  ylab("Risk Differences") +
+  ggtitle("IPTW Weighted Risk Difference between DES 5 mg and Placebo")
+
+```
+#Question 4
+```{r}
+#FIT OVERALL KM- 1 if ANY event, 0 otherwise
+####PLACEBO####
+KMO_P <- survfit(Surv(time, (event > 0)) ~ 1, data = placebo,weights =overall_wt)
+hO_P <- data.frame(times = KMO_P$time, s = KMO_P$surv)
+####DEG####
+KMO_D <- survfit(Surv(time, (event > 0)) ~ 1, data = DEG,weights =overall_wt)
+hO_D <- data.frame(times = KMO_D$time, s = KMO_D$surv)
+
+
+#CAUSE_SPECIFIC : PROSTRATE
+####PLACEBO####
+KM1_P <- survfit(Surv(time, (event == 1)) ~ 1, data = placebo, weights =overall_wt)
+h1_P <- data.frame(times = KM1_P$time, d1 = KM1_P$n.event, n1 = KM1_P$n.risk, haz1 = KM1_P$n.event/KM1_P$n.risk)
+####DEG####
+KM1_D <- survfit(Surv(time, (event == 1)) ~ 1, data = DEG, weights =overall_wt)
+h1_D <- data.frame(times = KM1_D$time, d1 = KM1_D$n.event, n1 = KM1_D$n.risk, haz1 = KM1_D$n.event/KM1_D$n.risk)
+
+
+#CAUSE_SPECIFIC : CVD
+####PLACEBO####
+KM2_P <- survfit(Surv(time, (event == 2)) ~ 1, data = placebo, weights =overall_wt)
+h2_P <- data.frame(times = KM2_P$time, d2 = KM2_P$n.event, n2 = KM2_P$n.risk, haz2 = KM2_P$n.event/KM2_P$n.risk)
+####DEG####
+KM2_D <- survfit(Surv(time, (event == 2)) ~ 1, data = DEG, weights =overall_wt)
+h2_D <- data.frame(times = KM2_D$time, d2 = KM2_D$n.event, n2 = KM2_D$n.risk, haz2 = KM2_D$n.event/KM2_D$n.risk)
+
+
+#CAUSE_SPECIFIC : OTHER
+####PLACEBO####
+KM3_P <- survfit(Surv(time, (event == 3)) ~ 1, data = placebo, weights =overall_wt)
+h3_P <- data.frame(times = KM3_P$time, d3 = KM3_P$n.event, n3 = KM3_P$n.risk, haz3 = KM3_P$n.event/KM3_P$n.risk)
+####DEG####
+KM3_D <- survfit(Surv(time, (event == 3)) ~ 1, data = DEG, weights =overall_wt)
+h3_D <- data.frame(times = KM3_D$time, d3 = KM3_D$n.event, n3 = KM3_D$n.risk, haz3 = KM3_D$n.event/KM3_D$n.risk)
+
+library(tidyr)
+#MERGE: we want 2 datasets; Placebo, DEG..each with all cause-specific haz and overall surv
+####PLACEBO####
+placebo_AJ <-  h1_P |> full_join(h2_P) |> full_join(h3_P) |> full_join(hO_P) |> 
+  replace_na(list(d1 = 0, haz1 = 0, d2 = 0, haz2 = 0,d3 = 0, haz3 = 0)) |> arrange(times)
+
+placebo_AJ <- placebo_AJ |> 
+  mutate(aj1 = cumsum(haz1 * lag(s, default = 1)), 
+         aj2 = cumsum(haz2 * lag(s, default = 1)), 
+         aj3 = cumsum(haz3 * lag(s, default = 1)),
+         composite = aj1 + aj2 + aj3, 
+         composite2 = 1 - s)
+
+###DEG####
+DEG_AJ <-  h1_D |> full_join(h2_D) |> full_join(h3_D) |> full_join(hO_D) |> 
+  replace_na(list(d1 = 0, haz1 = 0, d2 = 0, haz2 = 0,d3 = 0, haz3 = 0)) |> arrange(times)
+
+DEG_AJ <- DEG_AJ |> 
+  mutate(aj1 = cumsum(haz1 * lag(s, default = 1)), 
+         aj2 = cumsum(haz2 * lag(s, default = 1)), 
+         aj3 = cumsum(haz3 * lag(s, default = 1)),
+         composite = aj1 + aj2 + aj3, 
+         composite2 = 1 - s)
+
+#MERGE THE RISKS FOR PLACEBO AND DEG
+rdiff = merge(cbind(time = placebo_AJ$times,risk_P_O=placebo_AJ$composite, # Overall Time and risk for A=0
+                    risk_P_1=placebo_AJ$aj1,risk_P_2=placebo_AJ$aj2,risk_P_3=placebo_AJ$aj3),
+               # Overall Time and risk for A=1
+                cbind(time = DEG_AJ$times,risk_D_O=DEG_AJ$composite,risk_D_1=DEG_AJ$aj1,
+                      risk_D_2=DEG_AJ$aj2,risk_D_3=DEG_AJ$aj3),
+                by = "time",all=TRUE)                # Outer merge risk data on time
+
+rdiff = rdiff %>% 
+  fill(c("risk_P_O","risk_D_O","risk_P_1","risk_D_1","risk_P_2","risk_D_2","risk_P_3","risk_D_3"),.direction="down")     # Forward-filling all missing risks on aligned times
+
+rdiff$rd_O = with(rdiff, risk_D_O-risk_P_O)          # Computing the risk difference across columns
+rdiff$rd_1 = with(rdiff, risk_D_1-risk_P_1)          # Computing the risk difference across columns
+rdiff$rd_2 = with(rdiff, risk_D_2-risk_P_2)          # Computing the risk difference across columns
+rdiff$rd_3 = with(rdiff, risk_D_3-risk_P_3)          # Computing the risk difference across columns
+
+
+# display results
+library(ggplot2)
+plot_Q4<- ggplot() +
+  geom_step(data = rdiff, aes(time, rd_O, colour = "Overall"), linetype = "dashed") +
+  geom_step(data = rdiff, aes(time, rd_1, colour = "Prostate Cancer"), linetype = "dashed") +
+  geom_step(data = rdiff, aes(time, rd_2, colour = "CVD"), linetype = "dashed") +
+  geom_step(data = rdiff, aes(time, rd_3, colour = "Other"), linetype = "dashed") +
+  
+  xlab("Months since Randomization") +
+  ylab("Risk Differences") +
+  ggtitle("IPTW + IOSW Weighted Risk Difference between DES 5 mg and Placebo") +
+  
+  scale_color_manual(
+    name = "Cause of Death",
+    values = c(
+      "Overall" = "black",
+      "Prostate Cancer" = "blue",
+      "CVD" = "red",
+      "Other" = "green"
+    )
+  )
+setwd(setwd("/Users/sakshitewari/Desktop/717-pre-midterm-group/Final\ project\ Proofs"))
+
+#SAVE BOTH PLOTS
+
+ggsave("plot_Q3.png", plot = plot_Q3, width = 8, height = 6, dpi = 300)
+ggsave("plot_Q4.png", plot = plot_Q4, width = 8, height = 6, dpi = 300)
+
+```
+#Question 5
+```{r}
+#THE BOOTSTRAPS!!!
+#Compute the weights and weighted KM 200 times by randomly sampling wiht replacement.
+library(boot)
+#function for computing weights
+
+calc_risk<- function(data, indices, event_) {
+    d <- data[indices, ]
+    stack<-bind_rows(d,target)
+    #IOSW
+    model_iosw<- glm(s~ age + wt_index + cvd + htn + tumor_size + stage,data=stack, family =binomial(link='logit'))
+
+    d$pred_s <- predict(model_iosw,newdata = d,type = "response")
+    d$odds_s<- d$pred_s/(1-d$pred_s)
+    d$iosw<- 1/d$odds_s
+    #IPTW
+    model<- glm(des_num ~ age + wt_index + cvd + htn + tumor_size + stage, data=d, family=binomial(link='logit'))
+    d$pred_des<- predict(model,type="response")
+    model<- glm(des_num ~ age + wt_index + cvd + htn + tumor_size + stage, data=study, family=binomial(link='logit'))
+d$iptw<- ((d$des_num)/(d$pred_des)) + ((1-d$des_num)/(1-d$pred_des))
+    #Overall
+    d$overall_wt <- d$iptw * d$iosw
+    #make Placebo and DEG datasets
+    placebo = d[d$des_num==0,] 
+    DEG = d[d$des_num==1,]
+    #OVERALL
+    ####Placebb####
+    KMO_P <- survfit(Surv(time, (event > 0)) ~ 1, data = placebo,weights =overall_wt)
+    hO_P <- data.frame(times = KMO_P$time, s = KMO_P$surv)
+    ####DEG####
+    KMO_D <- survfit(Surv(time, (event > 0)) ~ 1, data = DEG,weights =overall_wt)
+    hO_D <- data.frame(times = KMO_D$time, s = KMO_D$surv)
+
+
+    #CAUSE_SPECIFIC : PROSTRATE
+    ####PLACEBO####
+    KM_P <- survfit(Surv(time, (event == event_)) ~ 1, data = placebo, weights =overall_wt)
+    h_P <- data.frame(times = KM_P$time, d = KM_P$n.event, n = KM_P$n.risk, haz = KM_P$n.event/KM_P$n.risk)
+    ####DEG####
+    KM_D <- survfit(Surv(time, (event == event_)) ~ 1, data = DEG, weights =overall_wt)
+    h_D <- data.frame(times = KM_D$time, d = KM_D$n.event, n = KM_D$n.risk, haz = KM_D$n.event/KM_D$n.risk)
+
+library(purrr)
+#MERGE: we want 2 datasets; Placebo, DEG..each with all cause-specific haz and overall surv
+####PLACEBO####
+placebo_AJ <- h_P |> full_join(hO_P) |> replace_na(list(d = 0, haz = 0)) |> arrange(times)
+
+placebo_AJ <- placebo_AJ |> 
+  mutate(aj = cumsum(haz * lag(s, default = 1)),
+         composite = 1 - s)
+
+###DEG####
+DEG_AJ <- h_D |> full_join(hO_D) |> replace_na(list(d = 0, haz = 0)) |> arrange(times)
+
+DEG_AJ <- DEG_AJ |> 
+  mutate(aj = cumsum(haz * lag(s, default = 1)), 
+         composite =1 - s)
+
+#MERGE THE RISKS FOR PLACEBO AND DEG
+rdiff = merge(cbind(time = placebo_AJ$times,risk_P_O=placebo_AJ$composite,  risk_P_event=placebo_AJ$aj),# Overall Time and risk for A=0
+               # Overall Time and risk for A=1
+                cbind(time = DEG_AJ$times,risk_D_O=DEG_AJ$composite,risk_D_event=DEG_AJ$aj),
+                by = "time",all=TRUE)                # Outer merge risk data on time
+
+rdiff = rdiff %>% 
+  fill(c("risk_P_O","risk_D_O","risk_P_event","risk_D_event"),.direction="down")     # Forward-filling all missing risks on aligned times
+
+rdiff$rd_O = with(rdiff, risk_D_O-risk_P_O)          # Computing the risk difference across columns
+rdiff$rd_event = with(rdiff, risk_D_event-risk_P_event)          # Computing the risk difference across columns
+return(rdiff$rd_event[rdiff$time==60])
+}
+set.seed(1)
+b_prostrate<- boot::boot(data = study, statistic = function(data, idx) calc_risk(data=data, indices=idx,event_=1), R = 1000)
+b_cvd<- boot::boot(data = study, statistic = function(data, idx) calc_risk(data=data, indices=idx,event_=2), R = 1000)
+b_other<- boot::boot(data = study, statistic = function(data, idx) calc_risk(data=data, indices=idx,event_=3), R = 1000)
+b_all<- boot::boot(data = study, statistic = function(data, idx) calc_risk(data=data, indices=idx,event_=c(1,2,3)), R = 1000)
+#2.5th and 97.5th for LCL UCL
+mean(b_prostrate$t)
+quantile(b_prostrate$t,probs = c(0.025, 0.975))
+mean(b_cvd$t)
+quantile(b_cvd$t,probs = c(0.025, 0.975))
+mean(b_other$t)
+quantile(b_other$t,probs = c(0.025, 0.975))
+mean(b_all$t)
+quantile(b_all$t,probs = c(0.025, 0.975))
+
+
+```
+
+
+
